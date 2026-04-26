@@ -76,7 +76,33 @@ def extract_mcq_block(roi_bgr: np.ndarray, option_labels: list[str] | None = Non
     return ExtractionResult(top_label, top_score, fill_scores, {"reason": "selected"})
 
 
-def extract_roman_block(roi_bgr: np.ndarray) -> ExtractionResult:
+def _generate_roman_numerals(count: int) -> list[str]:
+    """Generate Roman numerals from I to count.
+    
+    Args:
+        count: Number of Roman numerals to generate (1-100)
+    
+    Returns:
+        List of Roman numeral strings
+    """
+    roman_map = [
+        (1, 'I'), (4, 'IV'), (5, 'V'), (9, 'IX'), (10, 'X'),
+        (40, 'XL'), (50, 'L'), (90, 'XC'), (100, 'C'),
+    ]
+    
+    def int_to_roman(num: int) -> str:
+        result = ""
+        for value, numeral in reversed(roman_map):
+            count = num // value
+            if count:
+                result += numeral * count
+                num -= value * count
+        return result
+    
+    return [int_to_roman(i) for i in range(1, count + 1)]
+
+
+def extract_roman_block(roi_bgr: np.ndarray, num_options: int = 10) -> ExtractionResult:
     """Extract Roman numeral answer from Roman matching block.
     
     Process:
@@ -86,11 +112,13 @@ def extract_roman_block(roi_bgr: np.ndarray) -> ExtractionResult:
     
     Args:
         roi_bgr: Cropped block image
+        num_options: Number of Roman numeral options (1-100). Default 10 (I-X)
+                    Examples: 5 for I-V, 15 for I-XV
     
     Returns:
         ExtractionResult with selected Roman numeral
     """
-    roman_numerals = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X"]
+    roman_numerals = _generate_roman_numerals(min(num_options, 100))
     
     gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -118,33 +146,35 @@ def extract_roman_block(roi_bgr: np.ndarray) -> ExtractionResult:
     return ExtractionResult(top_label, top_score, fill_scores, {"reason": "selected"})
 
 
-def extract_tfng_block(roi_bgr: np.ndarray) -> ExtractionResult:
+def extract_tfng_block(roi_bgr: np.ndarray, options: list[str] | None = None) -> ExtractionResult:
     """Extract True/False/No Given answer from TFNG block.
     
     Process:
-    1. Divide into 3 regions (T, F, NG)
+    1. Divide into N regions based on options
     2. Measure fill in each region
     3. Return highest filled region
     
     Args:
         roi_bgr: Cropped block image
+        options: Custom option labels (default: ["T", "F", "NG"])
     
     Returns:
-        ExtractionResult with T/F/NG answer
+        ExtractionResult with selected answer
     """
-    options = ["T", "F", "NG"]
+    if options is None:
+        options = ["T", "F", "NG"]
     
     gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
     _, binary = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
     h, w = binary.shape
-    col_width = w // 3
+    col_width = w // len(options)
     
     fill_scores = {}
     for idx, option in enumerate(options):
         col_start = idx * col_width
-        col_end = (idx + 1) * col_width if idx < 2 else w
+        col_end = (idx + 1) * col_width if idx < len(options) - 1 else w
         
         col_region = binary[:, col_start:col_end]
         fill_ratio = cv2.countNonZero(col_region) / col_region.size if col_region.size > 0 else 0.0
@@ -224,10 +254,12 @@ def route_and_extract(roi_bgr: np.ndarray, block_label: str, option_config: dict
         return extract_mcq_block(roi_bgr, option_labels=options)
     
     elif block_label == "roman_block":
-        return extract_roman_block(roi_bgr)
+        num_options = option_config.get("num_options", 10)
+        return extract_roman_block(roi_bgr, num_options=num_options)
     
     elif block_label == "tfng_block":
-        return extract_tfng_block(roi_bgr)
+        options = option_config.get("options", ["T", "F", "NG"])
+        return extract_tfng_block(roi_bgr, options=options)
     
     elif block_label == "completion_block":
         return extract_completion_block(roi_bgr)

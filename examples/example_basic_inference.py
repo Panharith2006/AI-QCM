@@ -18,16 +18,28 @@ def main():
     pipeline = OMRPipeline(MODEL_PATH)
     pipeline.enable_debug()
     
-    # Optional: Define question mapping
-    # This maps YOLO detections to question IDs and options
+    # Optional: Define question mapping with custom configurations
+    # Each block can have different types and options
     question_mapping = {
+        # Standard MCQ - 4 options
         "block_0": {
             "question_id": "Q1",
             "options": ["A", "B", "C", "D"],
         },
+        # MCQ with 5 options
         "block_1": {
             "question_id": "Q2",
-            "options": ["A", "B", "C", "D"],
+            "options": ["A", "B", "C", "D", "E"],
+        },
+        # Roman matching - 7 options (I-VII)
+        "block_2": {
+            "question_id": "Q3",
+            "num_options": 7,  # Generates: I, II, III, IV, V, VI, VII
+        },
+        # TFNG block
+        "block_3": {
+            "question_id": "Q4",
+            "options": ["T", "F", "NG"],
         },
         # Add more as needed...
     }

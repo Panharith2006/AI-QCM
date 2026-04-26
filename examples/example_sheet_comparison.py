@@ -15,9 +15,9 @@ def main():
     TEACHER_ANSWERS = {
         "Q1": "B",
         "Q2": "A",
-        "Q3": "D",
-        "Q4": "C",
-        "Q5": "A",
+        "Q3": "VII",  # Roman numeral answer
+        "Q4": "T",
+        "Q5": "C",
     }
     OUTPUT_DIR = Path("outputs")
     OUTPUT_DIR.mkdir(exist_ok=True)
@@ -26,12 +26,13 @@ def main():
     pipeline = OMRPipeline(MODEL_PATH)
     pipeline.enable_debug()
     
-    # Question mapping
+    # Question mapping with flexible configuration
+    # Shows different question types and option counts
     question_mapping = {
         "block_0": {"question_id": "Q1", "options": ["A", "B", "C", "D"]},
-        "block_1": {"question_id": "Q2", "options": ["A", "B", "C", "D"]},
-        "block_2": {"question_id": "Q3", "options": ["A", "B", "C", "D"]},
-        "block_3": {"question_id": "Q4", "options": ["A", "B", "C", "D"]},
+        "block_1": {"question_id": "Q2", "options": ["A", "B", "C", "D", "E"]},  # 5 options
+        "block_2": {"question_id": "Q3", "num_options": 15},  # Roman I-XV
+        "block_3": {"question_id": "Q4", "options": ["T", "F", "NG"]},
         "block_4": {"question_id": "Q5", "options": ["A", "B", "C", "D"]},
     }
     
