@@ -13,18 +13,29 @@ class ScoreResult:
     details: dict[str, dict[str, str | bool]]
 
 
-def compare_answer_maps(teacher: dict[str, str], student: dict[str, str]) -> ScoreResult:
+def compare_answer_maps(teacher: dict[str, str], student: dict[str, dict | str]) -> ScoreResult:
     total = len(teacher)
     correct = 0
     unanswered = 0
     details: dict[str, dict[str, str | bool]] = {}
 
     for qid, expected in teacher.items():
-        got = student.get(qid, "UNANSWERED")
+        # Extract student answer from nested or simple format
+        student_entry = student.get(qid, None)
+        
+        if student_entry is None:
+            got = "UNANSWERED"
+        elif isinstance(student_entry, dict):
+            # New nested format
+            got = student_entry.get("answer", "UNANSWERED")
+        else:
+            # Old simple format or string
+            got = student_entry
+        
         is_correct = got == expected
         if is_correct:
             correct += 1
-        if got == "UNANSWERED":
+        if got == "UNANSWERED" or got is None:
             unanswered += 1
 
         details[qid] = {

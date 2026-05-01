@@ -20,6 +20,8 @@ class BlockDetection:
     y1: int
     x2: int
     y2: int
+    text: str = ""
+    text_confidence: float = 0.0
 
 
 class YoloLayoutDetector:

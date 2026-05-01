@@ -14,8 +14,8 @@ class ExtractionResult:
     debug_info: dict = None
 
 
-def extract_mcq_block(roi_bgr: np.ndarray, option_labels: list[str] | None = None) -> ExtractionResult:
-    """Extract MCQ answer from a detected MCQ block.
+def extract_circle_fill(roi_bgr: np.ndarray, option_labels: list[str] | None = None) -> ExtractionResult:
+    """Extract filled circle answer from a detected circle_fill block.
     
     Process:
     1. Convert to grayscale
@@ -68,12 +68,17 @@ def extract_mcq_block(roi_bgr: np.ndarray, option_labels: list[str] | None = Non
     margin = 0.03
     
     if top_score < min_threshold:
-        return ExtractionResult("UNANSWERED", top_score, fill_scores, {"reason": "below_threshold"})
+        return ExtractionResult("UNANSWERED", 0.0, fill_scores, {"reason": "below_threshold"})
     
-    if len(sorted_items) > 1 and (top_score - sorted_items[1][1]) < margin:
-        return ExtractionResult("AMBIGUOUS", top_score, fill_scores, {"reason": "too_close_to_second"})
+    # Compute differential confidence: top score - second highest
+    differential_confidence = top_score
+    if len(sorted_items) > 1:
+        second_score = sorted_items[1][1]
+        differential_confidence = top_score - second_score
+        if differential_confidence < margin:
+            return ExtractionResult("AMBIGUOUS", differential_confidence, fill_scores, {"reason": "too_close_to_second"})
     
-    return ExtractionResult(top_label, top_score, fill_scores, {"reason": "selected"})
+    return ExtractionResult(top_label, differential_confidence, fill_scores, {"reason": "selected"})
 
 
 def _generate_roman_numerals(count: int) -> list[str]:
@@ -102,8 +107,8 @@ def _generate_roman_numerals(count: int) -> list[str]:
     return [int_to_roman(i) for i in range(1, count + 1)]
 
 
-def extract_roman_block(roi_bgr: np.ndarray, num_options: int = 10) -> ExtractionResult:
-    """Extract Roman numeral answer from Roman matching block.
+def extract_roman_numeral(roi_bgr: np.ndarray, num_options: int = 10) -> ExtractionResult:
+    """Extract Roman numeral answer from roman_numeral block.
     
     Process:
     1. Segment image into rows
@@ -141,13 +146,19 @@ def extract_roman_block(roi_bgr: np.ndarray, num_options: int = 10) -> Extractio
     top_label, top_score = sorted_items[0]
     
     if top_score < 0.10:
-        return ExtractionResult("UNANSWERED", top_score, fill_scores, {"reason": "no_marking"})
+        return ExtractionResult("UNANSWERED", 0.0, fill_scores, {"reason": "no_marking"})
     
-    return ExtractionResult(top_label, top_score, fill_scores, {"reason": "selected"})
+    # Compute differential confidence: top score - second highest
+    differential_confidence = top_score
+    if len(sorted_items) > 1:
+        second_score = sorted_items[1][1]
+        differential_confidence = top_score - second_score
+    
+    return ExtractionResult(top_label, differential_confidence, fill_scores, {"reason": "selected"})
 
 
-def extract_tfng_block(roi_bgr: np.ndarray, options: list[str] | None = None) -> ExtractionResult:
-    """Extract True/False/No Given answer from TFNG block.
+def extract_tfng(roi_bgr: np.ndarray, options: list[str] | None = None) -> ExtractionResult:
+    """Extract True/False/No Given answer from tfng block.
     
     Process:
     1. Divide into N regions based on options
@@ -184,13 +195,19 @@ def extract_tfng_block(roi_bgr: np.ndarray, options: list[str] | None = None) ->
     top_label, top_score = sorted_items[0]
     
     if top_score < 0.08:
-        return ExtractionResult("UNANSWERED", top_score, fill_scores, {"reason": "no_marking"})
+        return ExtractionResult("UNANSWERED", 0.0, fill_scores, {"reason": "no_marking"})
     
-    return ExtractionResult(top_label, top_score, fill_scores, {"reason": "selected"})
+    # Compute differential confidence: top score - second highest
+    differential_confidence = top_score
+    if len(sorted_items) > 1:
+        second_score = sorted_items[1][1]
+        differential_confidence = top_score - second_score
+    
+    return ExtractionResult(top_label, differential_confidence, fill_scores, {"reason": "selected"})
 
 
-def extract_completion_block(roi_bgr: np.ndarray) -> ExtractionResult:
-    """Extract Completion block answer using position-based mapping.
+def extract_alpha_box(roi_bgr: np.ndarray) -> ExtractionResult:
+    """Extract alpha_box answer using position-based mapping.
     
     Process:
     1. Detect handwritten/filled regions
@@ -222,17 +239,21 @@ def extract_completion_block(roi_bgr: np.ndarray) -> ExtractionResult:
     
     cx = int(m["m10"] / m["m00"])
     cy = int(m["m01"] / m["m00"])
-    
-    # Position-based mapping (example: divide into quadrants)
     h, w = roi_bgr.shape[:2]
+    
+    # Position-based mapping with position-aware confidence
+    filled_area = float(cv2.contourArea(largest_contour))
+    total_area = h * w
+    
+    # Confidence proportional to filled area
+    fill_ratio = filled_area / total_area if total_area > 0 else 0.0
+    
     if cx < w // 2:
         answer = "LEFT"
-        confidence = 0.7
     else:
         answer = "RIGHT"
-        confidence = 0.7
     
-    return ExtractionResult(answer, confidence, {"filled_area": float(cv2.contourArea(largest_contour))}, {"centroid": (cx, cy)})
+    return ExtractionResult(answer, fill_ratio, {"filled_area": filled_area}, {"centroid": (cx, cy), "fill_ratio": fill_ratio})
 
 
 def route_and_extract(roi_bgr: np.ndarray, block_label: str, option_config: dict | None = None) -> ExtractionResult:
@@ -240,7 +261,7 @@ def route_and_extract(roi_bgr: np.ndarray, block_label: str, option_config: dict
     
     Args:
         roi_bgr: Cropped block image
-        block_label: Block class from YOLO (e.g., "mcq_block", "roman_block")
+        block_label: Block class from YOLO (e.g., "circle_fill", "roman_numeral")
         option_config: Optional configuration per block type
     
     Returns:
@@ -249,20 +270,20 @@ def route_and_extract(roi_bgr: np.ndarray, block_label: str, option_config: dict
     if option_config is None:
         option_config = {}
     
-    if block_label == "mcq_block":
+    if block_label == "circle_fill":
         options = option_config.get("options", ["A", "B", "C", "D"])
-        return extract_mcq_block(roi_bgr, option_labels=options)
+        return extract_circle_fill(roi_bgr, option_labels=options)
     
-    elif block_label == "roman_block":
+    elif block_label == "roman_numeral":
         num_options = option_config.get("num_options", 10)
-        return extract_roman_block(roi_bgr, num_options=num_options)
+        return extract_roman_numeral(roi_bgr, num_options=num_options)
     
-    elif block_label == "tfng_block":
+    elif block_label == "tfng":
         options = option_config.get("options", ["T", "F", "NG"])
-        return extract_tfng_block(roi_bgr, options=options)
+        return extract_tfng(roi_bgr, options=options)
     
-    elif block_label == "completion_block":
-        return extract_completion_block(roi_bgr)
+    elif block_label == "alpha_box":
+        return extract_alpha_box(roi_bgr)
     
     else:
         return ExtractionResult("UNKNOWN", 0.0, {}, {"reason": f"unknown_block_type: {block_label}"})

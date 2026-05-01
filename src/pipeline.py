@@ -1,156 +1,106 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import cv2
-import numpy as np
 from pathlib import Path
 
-from src.preprocessing.image_ops import load_image
-from src.preprocessing.contrast import preprocess_for_inference
-from src.alignment.perspective import perspective_correct
-from src.detection.yolo_layout import YoloLayoutDetector, crop_detection
-from src.detection.extractors import route_and_extract, ExtractionResult
-from src.mapping.answer_map import AnswerItem
+import numpy as np
+
+from src.OCR.ocr_extractor import OCRExtractor
 from src.scoring.compare import compute_metrics
 
 
 @dataclass
 class PipelineResult:
-    """Complete pipeline output."""
-    image_aligned: np.ndarray
-    image_detections: np.ndarray
-    detections_raw: list = field(default_factory=list)
-    extracted_answers: list[tuple[str, str, float]] = field(default_factory=list)  # (question_id, answer, confidence)
-    answer_map: dict[str, str] = field(default_factory=dict)
+    answers: dict[str, dict] = field(default_factory=dict)
+    extracted_answers: list[tuple[str, str, float, str]] = field(default_factory=list)
     metrics: dict = field(default_factory=dict)
     debug_info: dict = field(default_factory=dict)
+    is_valid: bool = True
+    errors: list[str] = field(default_factory=list)
 
 
 class OMRPipeline:
-    """Main orchestrator for the entire OMR pipeline."""
-    
-    def __init__(self, model_path: str):
-        """Initialize pipeline with YOLO model path."""
+    def __init__(self, model_path: str, trocr_model: str = "microsoft/trocr-small-printed", fill_threshold: float = 0.3):
         self.model_path = model_path
-        self.detector = YoloLayoutDetector(model_path)
+        self.fill_threshold = fill_threshold
         self.debug = False
-    
+        self.extractor = OCRExtractor(model_path, trocr_model=trocr_model)
+
     def process_image(
         self,
         image_input: str | np.ndarray,
         question_mapping: dict[str, dict] | None = None,
+        expected_question_ids: list[str] | None = None,
     ) -> PipelineResult:
-        """Process single OMR sheet end-to-end.
-        
-        Args:
-            image_input: File path or numpy array (BGR)
-            question_mapping: Map block_id to question_id and options
-                Example: {"block_0": {"question_id": "Q1", "options": ["A", "B", "C", "D"]}}
-        
-        Returns:
-            Complete pipeline result
-        """
-        # Layer 1: Input Acquisition
-        if isinstance(image_input, str):
-            image_original = load_image(image_input)
-        else:
-            image_original = image_input.copy()
-        
-        result = PipelineResult()
-        result.debug_info["step1_input_shape"] = image_original.shape
-        
-        # Layer 2: Preprocessing
-        image_preprocessed, original_size = preprocess_for_inference(image_original)
-        result.debug_info["step2_preprocessed_shape"] = image_preprocessed.shape
-        
-        # Layer 3: Geometric Normalization (Alignment)
-        image_aligned = perspective_correct(image_original)
-        result.image_aligned = image_aligned
-        result.debug_info["step3_aligned_shape"] = image_aligned.shape
-        
-        # Layer 4: AI Detection Layer
-        detections = self.detector.detect(image_aligned, conf=0.25)
-        result.detections_raw = detections
-        result.debug_info["step4_detections_count"] = len(detections)
-        result.debug_info["step4_detection_labels"] = [d.label for d in detections]
-        
-        # Layer 5: Region Cropping & Routing
-        # Layer 6: Region-Level Extraction (Core Logic)
-        extracted_answers = []
-        for block_idx, det in enumerate(detections):
-            roi = crop_detection(image_aligned, det)
-            
-            # Get configuration for this block if available
-            block_key = f"block_{block_idx}"
-            block_config = question_mapping.get(block_key, {}) if question_mapping else {}
-            
-            # Route and extract
-            extraction_result = route_and_extract(roi, det.label, block_config)
-            
-            question_id = block_config.get("question_id", f"Q{block_idx+1}")
-            extracted_answers.append((question_id, extraction_result.answer, extraction_result.confidence))
-            
-            if self.debug:
-                print(f"Block {block_idx} ({det.label}): Q{question_id} = {extraction_result.answer} ({extraction_result.confidence:.2f})")
-        
-        result.extracted_answers = extracted_answers
-        
-        # Layer 7: Answer Mapping
-        result.answer_map = {qid: ans for qid, ans, _ in extracted_answers}
-        
-        # Visualization (optional)
-        image_vis = image_aligned.copy()
-        for det in detections:
-            cv2.rectangle(image_vis, (det.x1, det.y1), (det.x2, det.y2), (0, 255, 0), 2)
-            cv2.putText(
-                image_vis,
-                f"{det.label}:{det.confidence:.2f}",
-                (det.x1, max(20, det.y1 - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (0, 255, 0),
-                2,
-                cv2.LINE_AA,
-            )
-        result.image_detections = image_vis
-        
-        result.debug_info["step7_final_answer_map"] = result.answer_map
-        
+        if not isinstance(image_input, str):
+            raise ValueError("OMRPipeline expects an image file path when using OCR extraction.")
+
+        ocr_result = self.extractor.extract(
+            image_input,
+            {
+                "answer_options": ["A", "B", "C", "D"],
+                "fill_threshold": self.fill_threshold,
+            },
+        )
+
+        result = PipelineResult(
+            is_valid=ocr_result.is_valid,
+            errors=list(ocr_result.errors),
+            debug_info=dict(ocr_result.debug_info),
+        )
+        result.debug_info["detected_questions"] = len(ocr_result.answers)
+
+        extracted_items = list(ocr_result.answers.items())
+        expected_ids = expected_question_ids or [f"Q{idx + 1}" for idx in range(len(extracted_items))]
+
+        for idx, qid in enumerate(expected_ids):
+            if idx < len(extracted_items):
+                _, answer = extracted_items[idx]
+                confidence = ocr_result.confidence.get(f"q{idx + 1}", 0.0)
+                result.extracted_answers.append((qid, answer, confidence, "mcq"))
+                result.answers[qid] = {
+                    "answer": answer,
+                    "confidence": confidence,
+                    "type": "mcq",
+                }
+            else:
+                result.answers[qid] = {
+                    "answer": None,
+                    "confidence": 0.0,
+                    "type": None,
+                }
+
         return result
-    
+
     def process_sheet_comparison(
         self,
         student_image_input: str | np.ndarray,
         teacher_answer_map: dict[str, str],
         question_mapping: dict[str, dict] | None = None,
+        expected_sheet_class: str | None = None,
     ) -> dict:
-        """Process student sheet and compare against teacher answers.
-        
-        Args:
-            student_image_input: Student sheet image
-            teacher_answer_map: Ground truth answers {question_id: answer}
-            question_mapping: Optional block configuration
-        
-        Returns:
-            Dictionary with scores and metrics
-        """
-        # Process student sheet
-        result = self.process_image(student_image_input, question_mapping)
-        student_map = result.answer_map
-        
-        # Compare
+        expected_question_ids = list(teacher_answer_map.keys())
+        result = self.process_image(student_image_input, question_mapping, expected_question_ids)
+        student_map = result.answers
+
         metrics = compute_metrics(student_map, teacher_answer_map)
         result.metrics = metrics
-        
+
+        class_validation = {
+            "detected_class": "mcq",
+            "expected_class": expected_sheet_class,
+            "class_match": True if expected_sheet_class is None else expected_sheet_class == "mcq",
+        }
+
         return {
             "student_answers": student_map,
             "teacher_answers": teacher_answer_map,
             "metrics": metrics,
+            "class_validation": class_validation,
             "debug": result.debug_info,
-            "image_aligned": result.image_aligned,
-            "image_detections": result.image_detections,
+            "image_aligned": None,
+            "image_detections": None,
         }
-    
+
     def enable_debug(self):
-        """Enable debug output."""
         self.debug = True
