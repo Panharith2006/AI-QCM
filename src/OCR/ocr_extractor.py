@@ -1,22 +1,29 @@
-"""MCQ extraction using YOLO detection + TrOCR text recognition + image fill detection."""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import warnings
 
 import cv2
 import numpy as np
-from PIL import Image
+import easyocr
+import torch
 
 from src.detection.yolo_layout import BlockDetection, YoloLayoutDetector, crop_detection
-from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+from src.layout.grid_detector import GridDetector
+from src.alignment.perspective import perspective_correct
+from src.OCR.ocr_preprocess import ensure_bgr, preprocess_for_ocr
+from src.OCR.ocr_reader import read_easyocr
+from src.OCR.text_normalizer import extract_answer_from_text, post_process_text
 
+warnings.filterwarnings('ignore', category=UserWarning)
 
+# ============================================================
+# RESULT STRUCTURE
+# ============================================================
 @dataclass
 class MCQExtractionResult:
-    """Result from OCR-based MCQ extraction."""
-    answers: dict[str, str]  # {"q1": "A", "q2": "B", ...}
-    confidence: dict[str, float]  # {"q1": 0.98, "q2": 0.95, ...}
+    answers: dict[str, str]
+    confidence: dict[str, float]
     marked_regions: dict[str, dict] = field(default_factory=dict)
     overall_confidence: float = 0.0
     is_valid: bool = True
@@ -24,333 +31,266 @@ class MCQExtractionResult:
     debug_info: dict = field(default_factory=dict)
 
 
+# ============================================================
+# OCR EXTRACTOR
+# ============================================================
 class OCRExtractor:
-    """Extract MCQ answers using YOLO + TrOCR + image fill detection"""
-    
-    def __init__(
-        self,
-        yolo_model_path: str,
-        trocr_model: str = "microsoft/trocr-small-printed"
-    ):
-        """
-        Initialize OCR extractor.
-        
-        Args:
-            yolo_model_path: Path to YOLO detection model
-            trocr_model: TrOCR model name from HuggingFace
-        """
+
+    def __init__(self, yolo_model_path: str, debug: bool = False):
+
         self.detector = YoloLayoutDetector(yolo_model_path)
         if self.detector.model is None:
-            raise RuntimeError(f"YOLO model not found or could not be loaded: {yolo_model_path}")
-        
-        # Load TrOCR
-        try:
-            self.processor = TrOCRProcessor.from_pretrained(trocr_model)
-            self.trocr_model = VisionEncoderDecoderModel.from_pretrained(trocr_model)
-        except Exception as e:
-            raise RuntimeError(f"Failed to load TrOCR: {e}")
-        
+            raise RuntimeError(f"YOLO model not found: {yolo_model_path}")
+
+        # Safe GPU handling
+        use_gpu = torch.cuda.is_available()
+        self.reader = easyocr.Reader(['en'], gpu=use_gpu, verbose=False)
+
+        self.grid_detector = GridDetector(debug=debug)
+
         self.image = None
         self.image_path = None
-    
-    def extract(
-        self,
-        image_path: str,
-        mcq_config: dict | None = None
-    ) -> MCQExtractionResult:
-        """
-        Extract MCQ answers from worksheet image.
-        
-        Args:
-            image_path: Path to worksheet image
-            mcq_config: Configuration dict with:
-                - answer_options: list (e.g., ["A", "B", "C", "D"])
-                - fill_threshold: float (0-1, default 0.3, darkness threshold for filled box)
-                - expected_questions: int (for validation)
-        
-        Returns:
-            MCQExtractionResult with extracted answers
-        """
+        self.debug = debug
+
+        self.grid_visualizations = {}
+        self.ocr_allowlist = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789IVXTFNG-_.:/()"
+
+    # ========================================================
+    # MAIN PIPELINE
+    # ========================================================
+    def extract(self, image_path: str, mcq_config: dict | None = None):
+
         try:
             self.image_path = image_path
             self.image = cv2.imread(image_path)
-            
+
             if self.image is None:
                 raise ValueError(f"Cannot read image: {image_path}")
-            
+
             config = mcq_config or {}
+            if config.get("align", True):
+                try:
+                    self.image = perspective_correct(self.image)
+                    if self.debug:
+                        print(f"Aligned document image: {self.image.shape}")
+                except Exception as align_error:
+                    if self.debug:
+                        print(f"Document alignment skipped: {align_error}")
+
             answer_options = config.get("answer_options", ["A", "B", "C", "D"])
-            fill_threshold = config.get("fill_threshold", 0.3)
-            
-            # Step 1: YOLO detection
+            self.ocr_allowlist = config.get(
+                "ocr_allowlist",
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789IVXTFNG-_.:/()",
+            )
+
             detections = self._detect_boxes()
-            
+
             if not detections:
                 return MCQExtractionResult(
                     answers={},
                     confidence={},
                     is_valid=False,
-                    errors=["No boxes detected by YOLO"]
+                    errors=["No boxes detected"]
                 )
-            
-            # Step 2: Extract text from boxes using TrOCR
-            boxes_with_text = self._extract_text_from_boxes(detections)
-            
-            # Step 3: Group by question
-            questions = self._group_boxes_by_question(boxes_with_text, answer_options)
-            
-            # Step 4: Determine which option is marked (using fill detection)
-            answers = {}
-            confidence_scores = {}
-            marked_regions = {}
-            
-            for q_id, options in questions.items():
-                marked_option, conf = self._find_marked_option(
-                    options, fill_threshold
-                )
-                
-                if marked_option:
-                    answers[q_id] = marked_option
-                    confidence_scores[q_id] = conf
-                    marked_regions[q_id] = {
-                        "option": marked_option,
-                        "fill_ratio": conf
-                    }
-            
-            # Calculate overall confidence
-            overall_conf = (
-                np.mean(list(confidence_scores.values()))
-                if confidence_scores else 0.0
+
+            detections = self._crop_boxes_from_detections(detections)
+
+            return self._extract_with_easyocr(
+                detections,
+                answer_options
             )
-            
-            return MCQExtractionResult(
-                answers=answers,
-                confidence=confidence_scores,
-                marked_regions=marked_regions,
-                overall_confidence=overall_conf,
-                is_valid=len(answers) > 0,
-                debug_info={
-                    "total_boxes_detected": len(detections),
-                    "boxes_with_text": len(boxes_with_text),
-                    "questions_found": len(questions)
-                }
-            )
-        
+
         except Exception as e:
+            import traceback
             return MCQExtractionResult(
                 answers={},
                 confidence={},
                 is_valid=False,
-                errors=[f"Extraction failed: {str(e)}"]
+                errors=[str(e), traceback.format_exc()],
+                debug_info={"error_type": type(e).__name__}
             )
-    
-    def _detect_boxes(self) -> list[BlockDetection]:
-        """
-        Step 1: Use YOLO to detect answer boxes.
-        
-        Returns:
-            List of detections with coordinates
-        """
-        detections = self.detector.detect(self.image, conf=0.3)
-        detections.sort(key=lambda det: (det.y1, det.x1))
-        return detections
-    
-    def _extract_text_from_boxes(self, detections: list[BlockDetection]) -> list[BlockDetection]:
-        """
-        Step 2: Extract text from each box using TrOCR (or fallback to Tesseract).
-        
-        Returns:
-            List of detections with extracted text
-        """
-        for det in detections:
-            crop = crop_detection(self.image, det)
-            
-            if crop.size == 0:
-                det.text = ""
-                det.text_confidence = 0.0
-                continue
-            
-            # Extract text with TrOCR
-            text = self._ocr_with_trocr(crop)
-            
-            det.text = text.upper() if text else ""
-            det.text_confidence = 0.9 if text else 0.0
-        
-        return detections
-    
-    def _ocr_with_trocr(self, image_crop: np.ndarray) -> str:
-        """Extract text from image crop using TrOCR."""
-        try:
-            # Convert to PIL
-            pil_image = Image.fromarray(cv2.cvtColor(image_crop, cv2.COLOR_BGR2RGB))
-            
-            # Preprocess
-            pixel_values = self.processor(pil_image, return_tensors="pt").pixel_values
-            
-            # Generate text
-            generated_ids = self.trocr_model.generate(pixel_values)
-            text = self.processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-            
-            return text.strip()
-        except Exception:
-            return ""
-    
-    def _group_boxes_by_question(
-        self,
-        boxes: list[BlockDetection],
-        answer_options: list[str]
-    ) -> dict[str, dict]:
-        """
-        Step 3: Group boxes into questions based on position.
-        
-        Returns:
-            {"q1": {"A": {...}, "B": {...}, ...}, "q2": {...}, ...}
-        """
-        if not boxes:
-            return {}
-        
-        questions = {}
-        question_num = 1
-        current_group = []
-        last_y = boxes[0].y1
-        
-        for box in boxes:
-            # If far vertically, start new group
-            if abs(box.y1 - last_y) > 50:
-                if current_group:
-                    q_id = f"q{question_num}"
-                    questions[q_id] = self._map_group_to_options(
-                        current_group, answer_options
-                    )
-                    question_num += 1
-                current_group = []
 
-            current_group.append(box)
-            last_y = box.y1
-        
-        # Don't forget last group
-        if current_group:
-            q_id = f"q{question_num}"
-            questions[q_id] = self._map_group_to_options(current_group, answer_options)
-        
-        return questions
-    
-    def _map_group_to_options(
-        self,
-        group: list[BlockDetection],
-        answer_options: list[str]
-    ) -> dict[str, dict]:
-        """
-        Map a group of boxes to answer options (A, B, C, D).
-        
-        Tries to match text extracted by TrOCR to option letters.
-        Falls back to positional ordering if text extraction fails.
-        """
-        # Try to match by extracted text
-        result = {}
-        used_boxes = set()
-        
-        for option in answer_options:
-            # Find box with matching text
-            best_match = None
-            best_score = 0.0
-            
-            for i, box in enumerate(group):
-                if i in used_boxes:
-                    continue
-                
-                # Check if text matches option letter
-                if option in getattr(box, "text", ""):
-                    best_match = (i, box, 1.0)
-                    break
-                elif getattr(box, "text_confidence", 0.0) > best_score:
-                    best_score = getattr(box, "text_confidence", 0.0)
-                    best_match = (i, box, best_score)
-            
-            if best_match:
-                idx, box, score = best_match
-                result[option] = {
-                    "box": box,
-                    "text": getattr(box, "text", ""),
-                    "text_confidence": getattr(box, "text_confidence", 0.0),
-                }
-                used_boxes.add(idx)
-        
-        # If we didn't get all options by text matching, use positional ordering
-        sorted_group = sorted(
-            [(i, box) for i, box in enumerate(group) if i not in used_boxes],
-            key=lambda x: x[1].x1
-        )
-        
-        for option, (idx, box) in zip(
-            [opt for opt in answer_options if opt not in result],
-            sorted_group
-        ):
-            result[option] = {
-                "box": box,
-                "text": getattr(box, "text", ""),
-                "text_confidence": getattr(box, "text_confidence", 0.0),
-            }
-        
-        return result
-    
-    def _find_marked_option(
-        self,
-        options: dict[str, dict],
-        fill_threshold: float = 0.3
-    ) -> tuple[str | None, float]:
-        """
-        Step 4: Determine which option box is marked/filled.
-        
-        Uses image processing to detect fill ratio (darkness).
-        
-        Returns:
-            (option_letter, confidence) e.g., ("A", 0.98)
-        """
-        marked_option = None
-        highest_fill_ratio = 0.0
-        
-        for option_letter, box_info in options.items():
-            crop = crop_detection(self.image, box_info["box"])
-            
-            if crop.size == 0:
+    # ========================================================
+    # OCR + GRID PROCESSING
+    # ========================================================
+    def _extract_with_easyocr(self, detections, answer_options):
+
+        answers = {}
+        confidence_scores = {}
+        marked_regions = {}
+        questions_found = 0
+        total_detections = len(detections)
+
+        for i, det in enumerate(detections):
+
+            crop = det.crop
+            if crop is None or crop.size == 0:
                 continue
-            
-            # Calculate fill ratio (darkness)
-            fill_ratio = self._calculate_fill_ratio(crop, fill_threshold)
-            
-            if fill_ratio > highest_fill_ratio:
-                highest_fill_ratio = fill_ratio
-                marked_option = option_letter
-        
-        # Confidence based on how much darker the marked option is than average
-        confidence = min(highest_fill_ratio * 1.2, 1.0) if marked_option else 0.0
-        
-        return marked_option, confidence
-    
-    def _calculate_fill_ratio(self, image_crop: np.ndarray, threshold: float = 0.3) -> float:
-        """
-        Calculate how filled/dark the box is.
-        
-        Returns:
-            Fill ratio (0.0 = empty, 1.0 = completely filled)
-        """
-        # Convert to grayscale
-        if len(image_crop.shape) == 3:
-            gray = cv2.cvtColor(image_crop, cv2.COLOR_BGR2GRAY)
-        else:
-            gray = image_crop
-        
-        # Normalize to 0-1
-        gray_normalized = gray.astype(float) / 255.0
-        
-        # Calculate darkness (lower values = darker)
-        # If pixel is dark (< threshold), count as filled
-        darkness = 1.0 - gray_normalized
-        fill_ratio = np.mean(darkness)
-        
-        # Only consider significant darkness
-        if fill_ratio > threshold:
-            return fill_ratio
-        else:
-            return 0.0
+
+            q_id = f"q{i + 1}"
+
+            try:
+                cells = self.grid_detector.detect_grid(crop)
+
+                # fallback if grid fails
+                if not cells:
+                    if self.debug:
+                        print(f"  No cells detected - using fallback whole-box extraction")
+                    text, conf = self._read_easyocr(crop)
+                    answer = self._extract_answer_from_text(text, answer_options)
+
+                    answers[q_id] = {
+                        "answer": answer,
+                        "confidence": conf,
+                        "type": "mcq",
+                        "num_cells": 1,
+                    }
+                    confidence_scores[q_id] = conf
+                    if answer:
+                        questions_found += 1
+                    continue
+
+                cell_texts = []
+                cell_conf = []
+
+                if self.debug:
+                    print(f"  Processing {len(cells)} cells from Q{i+1}...")
+
+                # process grid cells - pass BGR directly to EasyOCR, NOT preprocessed binary
+                for cell_idx, cell in enumerate(cells):
+                    cell_bgr = self._ensure_bgr(cell.crop)
+                    
+                    # Log cell details for debugging
+                    if self.debug:
+                        print(f"    Cell[{cell_idx}] ({cell.row},{cell.col}): crop_shape={cell.crop.shape if cell.crop is not None else 'None'}, bgr_shape={cell_bgr.shape}, coords=[{cell.x1}:{cell.x2},{cell.y1}:{cell.y2}]")
+                    
+                    text, conf = self._read_easyocr(cell_bgr)
+                    
+                    if self.debug:
+                        print(f"      → OCR: '{text}' (conf={conf:.2f})")
+
+                    cell_texts.append(text)
+                    cell_conf.append(conf)
+
+                # Debug: show ALL cell results clearly
+                if self.debug:
+                    print(f"  Cell extraction summary:")
+                    for idx, (txt, conf) in enumerate(zip(cell_texts, cell_conf)):
+                        status = "✓" if txt else "✗"
+                        print(f"    [{status}] Cell {idx}: '{txt}' (conf={conf:.2f})")
+
+                # Debug: show combined results
+                combined = " ".join([t for t in cell_texts if t])
+                cleaned = self._post_process(combined)
+                
+                if self.debug:
+                    print(f"  Combined from {len(cells)} cells: raw='{combined}' → cleaned='{cleaned}'")
+                    print(f"  Cell confidences: {cell_conf} → avg={float(np.mean([c for c in cell_conf if c > 0])) if any(c > 0 for c in cell_conf) else 0.0:.2f}")
+
+                # Generate grid visualization
+                try:
+                    grid_vis = self.grid_detector.visualize_grid(crop, cells)
+                    self.grid_visualizations[q_id] = grid_vis
+                    if self.debug:
+                        print(f"  Grid visualization created for {q_id}")
+                except Exception as e:
+                    if self.debug:
+                        print(f"Could not generate grid viz: {e}")
+
+                final_answer = self._extract_answer_from_text(cleaned, answer_options)
+
+                valid_conf = [c for c in cell_conf if c > 0]
+                avg_conf = float(np.mean(valid_conf)) if valid_conf else 0.0
+
+                answers[q_id] = {
+                    "answer": final_answer,
+                    "confidence": avg_conf,
+                    "type": "mcq",
+                    "num_cells": len(cells),
+                }
+                confidence_scores[q_id] = avg_conf
+                
+                if final_answer:
+                    questions_found += 1
+
+                marked_regions[q_id] = {
+                    "raw_cells": cell_texts,
+                    "combined": combined,
+                    "cleaned": cleaned,
+                    "confidence": avg_conf,
+                    "num_cells": len(cells),
+                    "extraction_method": "grid_detection + easyocr"
+                }
+
+            except Exception as e:
+                if self.debug:
+                    print(f"Error in {q_id}: {e}")
+
+        overall = float(np.mean(list(confidence_scores.values()))) if confidence_scores else 0.0
+
+        return MCQExtractionResult(
+            answers=answers,
+            confidence=confidence_scores,
+            marked_regions=marked_regions,
+            overall_confidence=overall,
+            is_valid=len(answers) > 0,
+            debug_info={
+                "mode": "yolo+grid+easyocr",
+                "total_boxes_detected": total_detections,
+                "extraction_method": "yolo → grid_detection → easyocr",
+                "questions_found": questions_found,
+                "questions_processed": len([d for d in detections if d.crop is not None and d.crop.size > 0]),
+            }
+        )
+
+    # ========================================================
+    # PREPROCESSING PIPELINE
+    # ========================================================
+    def _preprocess_for_ocr(self, img, use_threshold: bool = False):
+        return preprocess_for_ocr(img, use_threshold=use_threshold, debug=self.debug)
+
+    def _crop_to_content(self, img):
+        from src.OCR.ocr_preprocess import crop_to_content
+        return crop_to_content(img, debug=self.debug)
+
+    def _resize_preserve_aspect_ratio(self, img, min_side: int = 128, max_side: int = 320):
+        from src.OCR.ocr_preprocess import resize_preserve_aspect_ratio
+        return resize_preserve_aspect_ratio(img, min_side=min_side, max_side=max_side, debug=self.debug)
+
+    def _apply_light_threshold(self, img):
+        from src.OCR.ocr_preprocess import apply_light_threshold
+        return apply_light_threshold(img, debug=self.debug)
+
+    def _read_easyocr(self, img):
+        return read_easyocr(self.reader, img, self.ocr_allowlist, debug=self.debug)
+
+    # ========================================================
+    # ANSWER EXTRACTION
+    # ========================================================
+    def _extract_answer_from_text(self, text, options):
+        return extract_answer_from_text(text, options)
+
+    # ========================================================
+    # DETECTION + CROP
+    # ========================================================
+    def _detect_boxes(self):
+        dets = self.detector.detect(self.image, conf=0.3)
+        dets.sort(key=lambda d: (d.y1, d.x1))
+        return dets
+
+    def _crop_boxes_from_detections(self, detections):
+        for d in detections:
+            d.crop = crop_detection(self.image, d)
+        return detections
+
+    # ========================================================
+    # IMAGE HELPERS
+    # ========================================================
+    def _ensure_bgr(self, img):
+        return ensure_bgr(img)
+
+    # ========================================================
+    # CLEAN TEXT
+    # ========================================================
+    def _post_process(self, text):
+        return post_process_text(text)

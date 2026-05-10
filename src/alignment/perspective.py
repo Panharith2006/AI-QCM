@@ -3,7 +3,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-
+# Perspective correction to align document images before layout detection.
 def _order_points(pts: np.ndarray) -> np.ndarray:
     rect = np.zeros((4, 2), dtype="float32")
     s = pts.sum(axis=1)
@@ -15,7 +15,7 @@ def _order_points(pts: np.ndarray) -> np.ndarray:
     rect[3] = pts[np.argmax(diff)]
     return rect
 
-
+# Find the largest 4-point contour in the image, which should correspond to the document.
 def _find_document_contour(image: np.ndarray) -> np.ndarray | None:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -31,7 +31,7 @@ def _find_document_contour(image: np.ndarray) -> np.ndarray | None:
             return approx.reshape(4, 2)
     return None
 
-
+# Main function to perform perspective correction on the input image.
 def perspective_correct(image: np.ndarray, out_width: int = 1800, out_height: int = 2500) -> np.ndarray:
     corners = _find_document_contour(image)
     if corners is None:
