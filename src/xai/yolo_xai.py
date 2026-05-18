@@ -23,6 +23,35 @@ class YOLOXAI:
         self.model = getattr(model, "model", model)
         self.img_size = img_size
 
+    def _infer_device(self) -> torch.device:
+        if not isinstance(self.model, nn.Module):
+            return torch.device("cpu")
+        try:
+            return next(self.model.parameters()).device
+        except StopIteration:
+            return torch.device("cpu")
+
+    def _reset_inference_caches(self) -> None:
+        if not isinstance(self.model, nn.Module):
+            return
+
+        for module in self.model.modules():
+            for attr in ("anchors", "strides"):
+                tensor = getattr(module, attr, None)
+                if isinstance(tensor, torch.Tensor):
+                    try:
+                        if tensor.is_inference():
+                            setattr(module, attr, tensor.clone())
+                    except Exception:
+                        # Older torch builds may not expose is_inference(); best-effort only.
+                        pass
+            # Force recomputation when shape-dependent caches exist.
+            if hasattr(module, "shape"):
+                try:
+                    setattr(module, "shape", None)
+                except Exception:
+                    pass
+
     def generate(self, image: np.ndarray) -> XAIResult:
         if image is None or image.size == 0:
             return XAIResult(note="Empty image")
@@ -30,12 +59,17 @@ class YOLOXAI:
         if not isinstance(self.model, nn.Module):
             return XAIResult(note="Model is not a torch module")
 
-        target_layer = self._find_target_layer()
+        modules = self._module_list()
+        target_layer = self._find_target_layer(modules)
         if target_layer is None:
             return XAIResult(note="Could not locate a target layer for Grad-CAM")
 
-        feature_layers = self._find_feature_layers()
-        input_tensor = self._prepare_tensor(image)
+        feature_layers = self._find_feature_layers(modules)
+        device = self._infer_device()
+        input_tensor = self._prepare_tensor(image, device=device)
+
+        # Give each layer a unique, stable name to avoid collisions (many layers share class names).
+        name_map: dict[int, str] = {id(module): f"{idx}-{module.__class__.__name__}" for idx, module in enumerate(modules)}
 
         activations: dict[str, torch.Tensor] = {}
         gradients: dict[str, torch.Tensor] = {}
@@ -56,16 +90,19 @@ class YOLOXAI:
                         gradients[name] = tensor
             return hook
 
-        target_name = self._layer_name(target_layer)
+        target_name = name_map.get(id(target_layer), self._layer_name(target_layer))
         handles.append(target_layer.register_forward_hook(capture_forward(target_name)))
         handles.append(target_layer.register_full_backward_hook(capture_backward(target_name)))
 
         for layer in feature_layers:
-            layer_name = self._layer_name(layer)
+            layer_name = name_map.get(id(layer), self._layer_name(layer))
             handles.append(layer.register_forward_hook(capture_forward(layer_name)))
 
         self.model.zero_grad(set_to_none=True)
         self.model.eval()
+
+        # Ensure cached inference-mode tensors do not break Grad-CAM autograd.
+        self._reset_inference_caches()
 
         with torch.enable_grad():
             outputs = self.model(input_tensor)
@@ -96,11 +133,13 @@ class YOLOXAI:
             note="OK",
         )
 
-    def _prepare_tensor(self, image: np.ndarray) -> torch.Tensor:
+    def _prepare_tensor(self, image: np.ndarray, device: torch.device | None = None) -> torch.Tensor:
         resized = cv2.resize(image, (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
         rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
         tensor = torch.from_numpy(rgb).float() / 255.0
         tensor = tensor.permute(2, 0, 1).unsqueeze(0)
+        if device is not None:
+            tensor = tensor.to(device)
         return tensor.requires_grad_(True)
 
     def _select_score(self, outputs: Any) -> torch.Tensor | None:
@@ -116,8 +155,9 @@ class YOLOXAI:
 
         return None
 
-    def _find_target_layer(self):
-        modules = self._module_list()
+    def _find_target_layer(self, modules: list[nn.Module] | None = None):
+        if modules is None:
+            modules = self._module_list()
         if not modules:
             return None
 
@@ -126,8 +166,9 @@ class YOLOXAI:
             return non_detect[-1]
         return modules[-1]
 
-    def _find_feature_layers(self) -> list[nn.Module]:
-        modules = self._module_list()
+    def _find_feature_layers(self, modules: list[nn.Module] | None = None) -> list[nn.Module]:
+        if modules is None:
+            modules = self._module_list()
         non_detect = [module for module in modules if not self._is_detect_layer(module)]
         return non_detect[-4:-1] if len(non_detect) >= 4 else non_detect[:-1]
 

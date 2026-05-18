@@ -57,7 +57,6 @@ def compare_answer_maps(teacher: dict[str, str], student: dict[str, dict | str])
 
 
 def compute_metrics(student: dict[str, str], teacher: dict[str, str]) -> dict:
-    """Compute scoring metrics - wrapper for pipeline compatibility."""
     result = compare_answer_maps(teacher, student)
     return {
         "total_questions": result.total_questions,

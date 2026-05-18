@@ -41,7 +41,7 @@ def pick_default_model_path() -> str:
 # Streamlit app for AI-enhanced OMR processing with YOLO layout detection and EasyOCR extraction.
 st.set_page_config(page_title="AI OMR", layout="wide")
 st.title("AI-Enhanced Multi-Format OMR")
-st.caption("Pipeline: YOLO detection → Grid Detection → EasyOCR character extraction")
+st.caption("Pipeline: YOLO detection → Gemini Vision API text extraction")
 
 model_path_text = st.text_input("YOLO model path", value=pick_default_model_path())
 sheet_class = st.selectbox(
@@ -120,15 +120,29 @@ if uploaded is not None:
         cv2.imwrite(str(temp_aligned), aligned)
 
         if sheet_class == "Box answer sheet":
-            pipeline = get_pipeline(str(model_path))
-            pipeline.extractor.debug = True  # Enable debug output
-            with st.spinner("Running box-sheet extraction pipeline..."):
-                result = pipeline.process_image(str(temp_input))  # Use ORIGINAL image
+            from src.OCR.ocr_extractor import OCRExtractor
+            extractor = OCRExtractor(str(model_path), debug=True)
+            with st.spinner("Running Gemini Vision extraction..."):
+                ocr_result = extractor.extract(str(temp_input))
+
+            # Wrap into a simple object matching what the display code expects
+            class _Result:
+                pass
+            result          = _Result()
+            result.answers  = ocr_result.answers   # keys = Box_0, Box_1 …
+            result.is_valid = ocr_result.is_valid
+            result.errors   = ocr_result.errors
+            result.debug_info = ocr_result.debug_info
+            # Make extractor available so cell_crops can be read
+            pipeline        = _Result()
+            pipeline.extractor = extractor
+
         else:
             pipeline = get_circle_pipeline(str(model_path))
             pipeline.debug = True
             with st.spinner("Running circle-fill extraction pipeline..."):
                 result = pipeline.process_image(str(temp_input))
+
     except Exception as exc:
         st.error(f"Pipeline failed: {exc}")
         st.stop()
@@ -140,67 +154,122 @@ if uploaded is not None:
     col1, col2 = st.columns(2)
     with col1:
         st.subheader("Step 1: Original image")
-        st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), width='stretch')
+        st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), use_container_width=True)
     with col2:
-        st.subheader("Step 2: YOLO detections (original image)")
-        st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), width='stretch')
+        st.subheader("Step 2: YOLO detections")
+        st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), use_container_width=True)
 
+    # ── Result header ─────────────────────────────────────────────────────────
     if sheet_class == "Box answer sheet":
-        st.subheader("Step 3: Grid Detection + EasyOCR results")
+        st.subheader("Step 3: Gemini Vision — Extracted Answers")
     else:
         st.subheader("Step 3: Circle-fill OMR results")
-    
-    # Show detection count and method
-    extraction_mode = result.debug_info.get('mode', 'unknown')
-    extraction_method = result.debug_info.get('extraction_method', 'unknown')
-    st.info(f"Detected {result.debug_info.get('total_boxes_detected', 0)} boxes | Mode: **{extraction_mode}** | Method: **{extraction_method}**")
-    
-    if result.answers:
-        st.success(f"Extracted {len(result.answers)} answers")
-        for qid, answer_dict in result.answers.items():
-            answer = answer_dict.get('answer', '?')
-            conf = answer_dict.get('confidence', 0.0)
-            num_cells = answer_dict.get('num_cells', 0)
-            status = "🟢" if conf > 0.7 else "🟡" if conf > 0.4 else "🔴"
-            if sheet_class == "Circle fill sheet":
-                score_map = answer_dict.get("score_map", {})
-                st.write(
-                    f"{status} {qid}: **{answer}** | Choices: {num_cells} | Confidence: {conf:.2f} | "
-                    f"Scores: {score_map}"
-                )
-            else:
-                st.write(f"{status} {qid}: **{answer}** | Cells: {num_cells} | Confidence: {conf:.2f}")
 
+    extraction_mode   = result.debug_info.get("mode", "unknown")
+    extraction_method = result.debug_info.get("extraction_method", "unknown")
+    st.info(
+        f"Detected **{result.debug_info.get('total_boxes_detected', 0)}** region(s) | "
+        f"Mode: `{extraction_mode}` | Method: `{extraction_method}`"
+    )
+
+    if result.answers:
         if sheet_class == "Box answer sheet":
-            st.subheader("Grid Detection Visualizations")
-            if pipeline.extractor.grid_visualizations:
-                cols = st.columns(2)
-                for idx, (qid, grid_image) in enumerate(pipeline.extractor.grid_visualizations.items()):
-                    col_idx = idx % 2
-                    with cols[col_idx]:
-                        st.write(f"**{qid}** - Grid overlay")
-                        st.image(cv2.cvtColor(grid_image, cv2.COLOR_BGR2RGB), width='stretch')
-            else:
-                st.info("No grid visualizations available")
+            # ── Answer cards (text only, no crop images) ───────────────────
+            st.markdown("####  Extracted Answers")
+
+            answers_list = list(result.answers.items())
+            num_cols     = min(len(answers_list), 6)
+            rows         = [answers_list[i:i+num_cols]
+                            for i in range(0, len(answers_list), num_cols)]
+
+            for row in rows:
+                cols = st.columns(len(row))
+                for col, (qid, adict) in zip(cols, row):
+                    answer    = adict.get("answer") or "—"
+                    conf      = adict.get("confidence", 0.0)
+                    box_label = qid.replace("_", " ")   # "Box_0" → "Box 0"
+                    badge     = "" if conf > 0.7 else "" if conf > 0.3 else ""
+                    with col:
+                        st.markdown(
+                            f"""
+                            <div style="
+                                border:2px solid #5a5a8a;
+                                border-radius:10px;
+                                padding:14px 6px 10px;
+                                text-align:center;
+                                background:linear-gradient(135deg,#1e1e2e,#2a2a40);
+                                margin-bottom:8px;
+                            ">
+                                <div style="font-size:11px;color:#888;margin-bottom:4px;">{box_label}</div>
+                                <div style="font-size:32px;font-weight:bold;color:#c8c8ff;
+                                            letter-spacing:3px;line-height:1.1;">{answer}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+            # ── Summary line ───────────────────────────────────────────────
+            st.markdown("---")
+            all_answers = [(adict.get("answer") or "—") for _, adict in result.answers.items()]
+            st.markdown("**All answers (left → right):**")
+            st.code("  |  ".join(all_answers), language=None)
+            st.success(
+                f" Extracted **{len(result.answers)}** boxes | "
+                f"Non-empty: **{result.debug_info.get('questions_found', 0)}**"
+            )
+
+
         else:
-            st.subheader("Circle-fill Visualizations")
-            if pipeline.choice_visualizations:
-                cols = st.columns(2)
-                for idx, (qid, overlay) in enumerate(pipeline.choice_visualizations.items()):
-                    col_idx = idx % 2
-                    with cols[col_idx]:
-                        st.write(f"**{qid}** - Bubble overlay")
-                        st.image(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB), width='stretch')
-            else:
-                st.info("No circle visualizations available")
+            # Circle fill sheet display (unchanged)
+            st.success(f"Extracted {len(result.answers)} answers")
+            for qid, answer_dict in result.answers.items():
+                answer   = answer_dict.get("answer", "?")
+                conf     = answer_dict.get("confidence", 0.0)
+                status   = "" if conf > 0.7 else "" if conf > 0.4 else ""
+            st.markdown("#### Extracted Answers")
+            answers_list = list(result.answers.items())
+            num_cols     = min(len(answers_list), 6)
+            rows         = [answers_list[i:i+num_cols]
+                            for i in range(0, len(answers_list), num_cols)]
+            for row in rows:
+                cols = st.columns(len(row))
+                for col, (qid, adict) in zip(cols, row):
+                    answer = adict.get("answer") or "—"
+                    with col:
+                        st.markdown(
+                            f"""
+                            <div style="
+                                border:2px solid #5a8a5a;
+                                border-radius:10px;
+                                padding:14px 6px 10px;
+                                text-align:center;
+                                background:linear-gradient(135deg,#1e2e1e,#2a402a);
+                                margin-bottom:8px;
+                            ">
+                                <div style="font-size:11px;color:#888;margin-bottom:4px;">{qid}</div>
+                                <div style="font-size:32px;font-weight:bold;color:#c8ffc8;
+                                            letter-spacing:3px;line-height:1.1;">{answer}</div>
+                                <div style="font-size:10px;color:#666;margin-top:4px;">{badge} {conf:.0%}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+            st.markdown("---")
+            all_answers = [(adict.get("answer") or "—") for _, adict in result.answers.items()]
+            st.markdown("**All answers (left → right):**")
+            st.code("  |  ".join(all_answers), language=None)
+            found = sum(1 for _, a in result.answers.items() if a.get("answer"))
+            st.success(f" Extracted **{len(result.answers)}** questions | Non-empty: **{found}**")
+
+
     else:
-        st.warning(" No answers extracted - check image quality and detection")
-    
+        st.warning(" No answers extracted — check image quality and YOLO detection")
+
     st.write(f"Valid result: {result.is_valid}")
     if result.errors:
-        st.error(f" Errors: {'; '.join(result.errors)}")
-    
-    # Show debug info
+        st.error(f"Errors: {'; '.join(result.errors)}")
+
     with st.expander(" Debug Info"):
         st.json(result.debug_info)
 

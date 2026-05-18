@@ -4,8 +4,10 @@ pillow>=10.0.0
 streamlit>=1.34.0
 ultralytics>=8.2.0
 pytest>=8.0.0
-# For EasyOCR-based character recognition
-easyocr>=1.7.0
 torch>=2.0.0
 torchvision>=0.15.0
 tqdm>=4.65.0
+
+# Gemini API for text processing and image understanding
+google-genai>=0.1.0
+requests>=2.31.0

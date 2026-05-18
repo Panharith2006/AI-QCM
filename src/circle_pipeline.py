@@ -1,18 +1,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import logging
 import re
 
 import cv2
 import numpy as np
-import easyocr
-import torch
 
 from src.alignment.perspective import perspective_correct
 from src.detection.yolo_layout import YoloLayoutDetector, crop_detection
-from src.OCR.ocr_preprocess import ensure_bgr, preprocess_for_ocr
-from src.OCR.ocr_reader import read_easyocr
 from src.pipeline import PipelineResult
+
+try:
+    from src.llm.gemini_processor import GeminiProcessor
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,7 +41,16 @@ class CircleFillPipeline:
         self.fill_threshold = fill_threshold
         self.align = align
         self.detector = YoloLayoutDetector(model_path)
-        self.reader = easyocr.Reader(['en'], gpu=torch.cuda.is_available(), verbose=False)
+        
+        # Initialize Gemini for text extraction
+        if not GEMINI_AVAILABLE:
+            raise ImportError("Gemini processor not found. Install: pip install google-generativeai")
+        
+        try:
+            self.gemini = GeminiProcessor(debug=False)
+        except ValueError as e:
+            raise RuntimeError(f"Gemini setup failed: {e}. Set GOOGLE_API_KEY environment variable")
+        
         self.ocr_allowlist = "ABCDEFGHIJKLMNOPQRSTUVWXYZ()-.\/"
         self.debug = False
         self.choice_visualizations: dict[str, np.ndarray] = {}
@@ -63,88 +77,151 @@ class CircleFillPipeline:
                 if aligned is not None and aligned.size > 0:
                     image = aligned
             except Exception:
-                if self.debug:
-                    print("Circle-fill alignment skipped due to an exception")
-
-        detections = self.detector.detect(image)
-        detections.sort(key=lambda det: (det.y1, det.x1))
+                pass
 
         result = PipelineResult(
-            is_valid=bool(detections),
+            is_valid=True,
             debug_info={
-                "mode": "circle",
-                "total_boxes_detected": len(detections),
-                "fill_threshold": self.fill_threshold,
+                "mode":               "circle",
+                "extraction_method":  "gemini_whole_image",
+                "total_boxes_detected": 0,
             },
         )
 
-        if not detections:
+        # ── Send whole image to Gemini ─────────────────────────────────────
+        prompt = (
+            "This is a multiple-choice exam answer sheet. "
+            "Students have circled one answer option for each question. "
+            "For EVERY question on this sheet, identify which option (A, B, C, D, or E) is circled. "
+            "Return ONLY a comma-separated list in order: Q1=B, Q2=C, Q3=A, ... "
+            "Use this exact format. If a question has no clear answer write Q?=-. "
+            "Do NOT include any explanation, just the list."
+        )
+
+        try:
+            gemini_result = self.gemini.extract_text_from_image(image, prompt_override=prompt)
+            raw = gemini_result.get("text", "").strip()
+            conf = gemini_result.get("confidence", 0.85)
+
+            if self.debug:
+                print(f"Gemini whole-image raw: '{raw}'")
+
+            # Parse "Q1=B, Q2=C, Q3=A, ..."
+            import re
+            pairs = re.findall(r"Q(\d+)\s*=\s*([A-E\-])", raw, re.IGNORECASE)
+
+            if not pairs:
+                result.is_valid = False
+                result.errors.append(f"Gemini returned unparseable output: '{raw}'")
+                result.debug_info["raw_gemini"] = raw
+                return result
+
+            for qnum, letter in pairs:
+                qid    = f"Q{qnum}"
+                answer = letter.upper() if letter != "-" else None
+                result.answers[qid] = {
+                    "answer":     answer,
+                    "confidence": conf if answer else 0.0,
+                    "type":       "circle",
+                    "num_cells":  5,
+                }
+                result.extracted_answers.append((qid, answer, conf, "circle"))
+
+            found = sum(1 for a in result.answers.values() if a["answer"])
+            result.debug_info.update({
+                "total_boxes_detected": len(pairs),
+                "questions_found":      found,
+                "raw_gemini":           raw,
+            })
+
+        except Exception as e:
             result.is_valid = False
-            result.errors.append("No question regions detected")
-            return result
+            result.errors.append(f"Gemini extraction failed: {e}")
+            logger.error(f"Circle-fill Gemini error: {e}")
 
-        extracted_items = []
-        expected_ids = expected_question_ids or [f"Q{idx + 1}" for idx in range(len(detections))]
-
-        for idx, det in enumerate(detections):
-            qid = expected_ids[idx] if idx < len(expected_ids) else f"Q{idx + 1}"
-            crop = crop_detection(image, det)
-            analysis = self._analyze_crop(crop, qid)
-
-            result.answers[qid] = {
-                "answer": analysis.answer,
-                "confidence": analysis.confidence,
-                "type": "circle",
-                "num_cells": analysis.num_choices,
-                "is_ambiguous": analysis.is_ambiguous,
-                "score_map": analysis.score_map,
-            }
-            result.extracted_answers.append((qid, analysis.answer, analysis.confidence, "circle"))
-            extracted_items.append(analysis)
-
-        result.debug_info["detected_questions"] = len(extracted_items)
-        result.debug_info["questions_processed"] = len(extracted_items)
-        result.debug_info["answers_found"] = sum(1 for item in extracted_items if item.answer is not None)
-        result.debug_info["mode_detail"] = "yolo+omr"
         return result
+
 
     def _analyze_crop(self, crop: np.ndarray, qid: str) -> BubbleAnalysis:
         if crop.size == 0:
             return BubbleAnalysis(qid, None, 0.0, num_choices=0)
 
-        text_candidates = []
-        search_regions = [crop[:, : max(1, int(crop.shape[1] * 0.5))], crop]
+        prompt = (
+            "This image shows one question from a multiple-choice exam sheet. "
+            "The student has circled or marked one of the answer options (A, B, C, D, or E). "
+            "Look carefully at which option has a circle or mark drawn around it. "
+            "Return ONLY the single letter of the selected option (A, B, C, D, or E). "
+            "If no option is clearly marked, return a dash (-). "
+            "Return nothing else — just one character."
+        )
 
-        for region in search_regions:
-            region = ensure_bgr(region)
-            text, conf = read_easyocr(self.reader, region, self.ocr_allowlist, debug=self.debug)
-            if text:
-                text_candidates.append((text, conf))
+        try:
+            result = self.gemini.extract_text_from_image(crop, prompt_override=prompt)
+            text = result.get("text", "").strip().upper()
+            conf = result.get("confidence", 0.0)
 
-        if not text_candidates:
-            return BubbleAnalysis(qid, None, 0.0, score_map={}, num_choices=0)
+            if self.debug:
+                print(f"  {qid}: Gemini → '{text}' (conf={conf:.2f})")
 
-        best_text, best_conf = max(text_candidates, key=lambda item: item[1])
-        cleaned = self._normalize_text(best_text)
-        answer = self._extract_parenthesized_answer(cleaned)
+            # Accept only A-E
+            answer = text[0] if text and text[0] in "ABCDE" else None
+            score_map = {answer: 1.0} if answer else {}
 
-        if answer is None:
-            answer = self._extract_labeled_answer(cleaned)
+        except Exception as e:
+            if self.debug:
+                logger.error(f"Gemini extraction failed for {qid}: {e}")
+            answer, conf, score_map = None, 0.0, {}
 
-        score_map = self._extract_answer_scores(cleaned)
         self.choice_visualizations[qid] = crop.copy()
-
-        if self.debug:
-            print(f"  OCR crop text for {qid}: '{best_text}' -> '{cleaned}' -> answer='{answer}'")
 
         return BubbleAnalysis(
             question_id=qid,
             answer=answer,
-            confidence=float(best_conf) if answer is not None else 0.0,
+            confidence=float(conf) if answer else 0.0,
             score_map=score_map,
-            num_choices=len(score_map) if score_map else 0,
+            num_choices=5,
             is_ambiguous=False,
         )
+
+
+    def _preprocess_cell(self, img: np.ndarray) -> np.ndarray:
+        """Preprocess cell image for better Gemini extraction."""
+        if img is None or img.size == 0:
+            return img
+        
+        try:
+            # 1. Convert to grayscale
+            if len(img.shape) == 3:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = img
+            
+            # 2. Upscale if too small
+            h, w = gray.shape
+            if h < 64 or w < 64:
+                scale = max(2, 64 // min(h, w))
+                gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+            
+            # 3. Enhance contrast using CLAHE
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+            gray = clahe.apply(gray)
+            
+            # 4. Denoise
+            gray = cv2.bilateralFilter(gray, 5, 75, 75)
+            
+            # 5. Adaptive thresholding
+            binary = cv2.adaptiveThreshold(
+                gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+            )
+            
+            # 6. Convert back to BGR
+            preprocessed = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+            return preprocessed
+            
+        except Exception as e:
+            if self.debug:
+                logger.warning(f"Preprocessing failed: {e}")
+            return img
 
     def _normalize_text(self, text: str) -> str:
         if not text:
