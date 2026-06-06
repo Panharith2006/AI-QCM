@@ -1,5 +1,5 @@
-"""OCR-based answer extraction (TrOCR + YOLO - No LLM)."""
+"""Gemini Vision-based answer extraction with YOLO detection."""
 
-from src.OCR.ocr_extractor import OCRExtractor, MCQExtractionResult
+from src.OCR.gemini_ocr_extractor import GeminiOCRExtractor, GeminiExtractionResult
 
-__all__ = ["OCRExtractor", "MCQExtractionResult"]
+__all__ = ["GeminiOCRExtractor", "GeminiExtractionResult"]

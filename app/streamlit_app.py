@@ -1,275 +1,582 @@
 from __future__ import annotations
 
-from pathlib import Path
+import copy
+import importlib
+import json
 import sys
 import tempfile
-
 import warnings
+from io import StringIO
+from pathlib import Path
+import tempfile
+import os
+
 warnings.filterwarnings("ignore")
 
 import cv2
 import numpy as np
+import pandas as pd
 import streamlit as st
 
+# Add parent directory to path for imports
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.alignment.perspective import perspective_correct
-from src.detection.yolo_layout import YoloLayoutDetector
-from src.circle_pipeline import CircleFillPipeline
-from src.xai.yolo_xai import YOLOXAI
-from src.pipeline import OMRPipeline
+from config import PAGE_CONFIG
+from answer_processing import compare_answers
+from reference_manager import load_reference
+from gemini_omr import GeminiOMRChecker
+from pages.teacher_page import render_teacher_page
+from pages.student_page import render_circle_completion_page, render_student_page
 
-DEFAULT_MODEL_PATHS = [
-    ROOT / "artifacts" / "yolo" / "best.pt",
-]
-# Utility functions for model path resolution and default selection.
-def resolve_model_path(path_text: str) -> Path:
-    path = Path(path_text).expanduser()
-    if path.is_absolute():
-        return path
-    return (ROOT / path).resolve()
-
-# Pick the first existing model path from the defaults, or return the first one if none exist.
-def pick_default_model_path() -> str:
-    for candidate in DEFAULT_MODEL_PATHS:
-        if candidate.exists():
-            return str(candidate)
-    return str(DEFAULT_MODEL_PATHS[0])
-
-# Streamlit app for AI-enhanced OMR processing with YOLO layout detection and EasyOCR extraction.
-st.set_page_config(page_title="AI OMR", layout="wide")
-st.title("AI-Enhanced Multi-Format OMR")
-st.caption("Pipeline: YOLO detection → Gemini Vision API text extraction")
-
-model_path_text = st.text_input("YOLO model path", value=pick_default_model_path())
-sheet_class = st.selectbox(
-    "Sheet class",
-    ["Box answer sheet", "Circle fill sheet"],
-    index=0,
-)
-uploaded = st.file_uploader("Upload sheet image", type=["jpg", "jpeg", "png"])
-
-# Main processing logic when an image is uploaded
-def get_pipeline(yolo_path: str) -> OMRPipeline:
-    return OMRPipeline(yolo_path)
+OMRCHECKER_ROOT = ROOT / "OMRChecker"
+OMRCHECKER_PATH = str(OMRCHECKER_ROOT)
 
 
-def get_circle_pipeline(yolo_path: str) -> CircleFillPipeline:
-    return CircleFillPipeline(yolo_path)
+def get_sample_templates() -> dict[str, str]:
+    templates: dict[str, str] = {}
+    samples_dir = OMRCHECKER_ROOT / "samples"
 
-if uploaded is not None:
-    model_path = resolve_model_path(model_path_text)
-    if not model_path.exists():
-        st.error(
-            "YOLO model not found. Use a valid path such as "
-            f"{DEFAULT_MODEL_PATHS[0]}."
-        )
-        st.stop()
+    if not samples_dir.exists():
+        return templates
 
-    data = np.frombuffer(uploaded.read(), dtype=np.uint8)
-    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    for template_file in samples_dir.rglob("template.json"):
+        relative_path = template_file.relative_to(samples_dir)
+        parts = list(relative_path.parent.parts)
 
-    if image is None:
-        st.error("Could not decode image")
-        st.stop()
-
-    # IMPORTANT: Detect on ORIGINAL image (YOLO was trained on originals)
-    detector = YoloLayoutDetector(str(model_path))
-    detections = detector.detect(image)
-    
-    # Then align for better processing
-    aligned = perspective_correct(image)
-    
-    # Check perspective correction quality
-    if aligned is None or aligned.size == 0:
-        st.error("Perspective correction failed")
-        st.stop()
-    
-    # Show quality metrics
-    alignment_quality = "Good" if aligned.shape == (2500, 1800, 3) else "Check"
-    st.caption(
-        f"Class: {sheet_class} | Alignment: {alignment_quality} | Shape: {aligned.shape} | "
-        f"Boxes detected on original: {len(detections)}"
-    )
-
-    vis = image.copy()  # Draw on ORIGINAL
-    for det in detections:
-        cv2.rectangle(vis, (det.x1, det.y1), (det.x2, det.y2), (0, 255, 0), 2)
-        cv2.putText(
-            vis,
-            f"{det.label}:{det.confidence:.2f}",
-            (det.x1, max(20, det.y1 - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (0, 255, 0),
-            1,
-            cv2.LINE_AA,
-        )
-
-    temp_input = None
-    temp_aligned = None
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as tmp:
-            cv2.imwrite(tmp.name, image)  # Save ORIGINAL image
-            temp_input = Path(tmp.name)
-
-        # Also save aligned for visualization
-        temp_aligned = temp_input.with_name(f"{temp_input.stem}_aligned.png")
-        cv2.imwrite(str(temp_aligned), aligned)
-
-        if sheet_class == "Box answer sheet":
-            from src.OCR.ocr_extractor import OCRExtractor
-            extractor = OCRExtractor(str(model_path), debug=True)
-            with st.spinner("Running Gemini Vision extraction..."):
-                ocr_result = extractor.extract(str(temp_input))
-
-            # Wrap into a simple object matching what the display code expects
-            class _Result:
-                pass
-            result          = _Result()
-            result.answers  = ocr_result.answers   # keys = Box_0, Box_1 …
-            result.is_valid = ocr_result.is_valid
-            result.errors   = ocr_result.errors
-            result.debug_info = ocr_result.debug_info
-            # Make extractor available so cell_crops can be read
-            pipeline        = _Result()
-            pipeline.extractor = extractor
-
+        if parts:
+            template_name = " → ".join(parts) if len(parts) > 1 else parts[0]
         else:
-            pipeline = get_circle_pipeline(str(model_path))
-            pipeline.debug = True
-            with st.spinner("Running circle-fill extraction pipeline..."):
-                result = pipeline.process_image(str(temp_input))
+            template_name = "root"
 
+        templates[template_name] = str(template_file)
+
+    return templates
+
+
+@st.cache_resource
+def load_omrchecker_components() -> dict[str, object] | None:
+    if not OMRCHECKER_ROOT.exists():
+        return None
+
+    if OMRCHECKER_PATH not in sys.path:
+        sys.path.insert(0, OMRCHECKER_PATH)
+
+    root_src_modules = {
+        name: module
+        for name, module in sys.modules.items()
+        if name == "src" or name.startswith("src.")
+    }
+
+    try:
+        for name in list(root_src_modules):
+            sys.modules.pop(name, None)
+
+        importlib.invalidate_caches()
+
+        template_module = importlib.import_module("src.template")
+        defaults_module = importlib.import_module("src.defaults")
+        core_module = importlib.import_module("src.core")
+        image_module = importlib.import_module("src.utils.image")
+
+        return {
+            "Template": template_module.Template,
+            "CONFIG_DEFAULTS": defaults_module.CONFIG_DEFAULTS,
+            "ImageInstanceOps": core_module.ImageInstanceOps,
+            "ImageUtils": image_module.ImageUtils,
+        }
     except Exception as exc:
-        st.error(f"Pipeline failed: {exc}")
-        st.stop()
+        st.error(f"OMRChecker import error: {exc}")
+        return None
     finally:
-        for temp_path in (temp_input, temp_aligned):
-            if temp_path is not None and temp_path.exists():
-                temp_path.unlink(missing_ok=True)
+        for name in list(sys.modules):
+            if name == "src" or name.startswith("src."):
+                if name not in root_src_modules:
+                    sys.modules.pop(name, None)
+        sys.modules.update(root_src_modules)
+
+
+@st.cache_resource
+def load_template(template_path: str):
+    components = load_omrchecker_components()
+    if not components:
+        st.error("OMRChecker not available")
+        return None
+
+    try:
+        template_cls = components["Template"]
+        config_defaults = components["CONFIG_DEFAULTS"]
+        return template_cls(Path(template_path), config_defaults)
+    except Exception as exc:
+        st.error(f"Failed to load template: {exc}")
+        return None
+
+
+def build_omrchecker_config(auto_align: bool):
+    components = load_omrchecker_components()
+    if not components:
+        return None
+
+    config = copy.deepcopy(components["CONFIG_DEFAULTS"])
+    config.alignment_params.auto_align = auto_align
+    return config
+
+
+def process_omr_image(image: np.ndarray, template, config=None) -> dict:
+    try:
+        components = load_omrchecker_components()
+        if not components:
+            return {
+                "success": False,
+                "error": "OMRChecker is not available",
+                "response": None,
+                "processed_image": None,
+            }
+
+        if config is None:
+            config = build_omrchecker_config(auto_align=False)
+
+        if config is None:
+            return {
+                "success": False,
+                "error": "Failed to build OMRChecker configuration",
+                "response": None,
+                "processed_image": None,
+            }
+
+        image_utils = components["ImageUtils"]
+        image_instance_ops = components["ImageInstanceOps"](config)
+
+        if image.ndim == 3:
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+
+        image = image_utils.resize_util(
+            image,
+            config.dimensions.processing_width,
+            config.dimensions.processing_height,
+        )
+
+        processed = image_instance_ops.apply_preprocessors("temp", image, template)
+        response = image_instance_ops.read_omr_response(template, processed, "temp")
+
+        answers = {}
+        is_invalid = None
+        multi_mark_count = None
+
+        if isinstance(response, (list, tuple)):
+            if len(response) > 0 and isinstance(response[0], dict):
+                answers = response[0]
+            if len(response) > 2:
+                is_invalid = response[2]
+            if len(response) > 3:
+                multi_mark_count = response[3]
+        elif isinstance(response, dict):
+            answers = response
+
+        return {
+            "success": True,
+            "response": answers,
+            "processed_image": processed,
+            "raw_response": response,
+            "is_invalid": is_invalid,
+            "multi_mark_count": multi_mark_count,
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": str(exc),
+            "response": None,
+            "processed_image": None,
+            "raw_response": None,
+            "is_invalid": None,
+            "multi_mark_count": None,
+        }
+
+
+def render_template_single_page():
+    st.markdown("### Process a single OMRChecker sheet")
 
     col1, col2 = st.columns(2)
+
     with col1:
-        st.subheader("Step 1: Original image")
-        st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), use_container_width=True)
+        st.markdown("#### Template Selection")
+        template_source = st.radio(
+            "Template source",
+            ["Use Sample", "Upload Custom"],
+            label_visibility="collapsed",
+            key="omr_template_source_single",
+        )
+
+        template_path = None
+        if template_source == "Use Sample":
+            templates = get_sample_templates()
+            if templates:
+                template_name = st.selectbox(
+                    "Select template",
+                    list(templates.keys()),
+                    label_visibility="collapsed",
+                    key="omr_template_select_single",
+                )
+                template_path = templates[template_name]
+                st.success(f"Template: {template_name}")
+            else:
+                st.warning("No sample templates found in OMRChecker/samples/")
+                st.stop()
+        else:
+            template_file = st.file_uploader(
+                "Upload template JSON",
+                type="json",
+                label_visibility="collapsed",
+                key="omr_template_upload_single",
+            )
+            if template_file:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
+                    tmp.write(template_file.getbuffer())
+                    template_path = tmp.name
+                st.success("Template uploaded")
+            else:
+                st.warning("Please upload a template JSON file")
+                st.stop()
+
     with col2:
-        st.subheader("Step 2: YOLO detections")
-        st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), use_container_width=True)
+        st.markdown("#### Image Upload")
+        uploaded_img = st.file_uploader(
+            "Upload OMR sheet",
+            type=["jpg", "jpeg", "png"],
+            label_visibility="collapsed",
+            key="omr_image_upload_single",
+        )
 
-    # ── Result header ─────────────────────────────────────────────────────────
-    if sheet_class == "Box answer sheet":
-        st.subheader("Step 3: Gemini Vision — Extracted Answers")
-    else:
-        st.subheader("Step 3: Circle-fill OMR results")
+    if uploaded_img and template_path:
+        template = load_template(template_path)
+        if not template:
+            st.stop()
 
-    extraction_mode   = result.debug_info.get("mode", "unknown")
-    extraction_method = result.debug_info.get("extraction_method", "unknown")
-    st.info(
-        f"Detected **{result.debug_info.get('total_boxes_detected', 0)}** region(s) | "
-        f"Mode: `{extraction_mode}` | Method: `{extraction_method}`"
-    )
+        img_data = np.frombuffer(uploaded_img.read(), dtype=np.uint8)
+        image = cv2.imdecode(img_data, cv2.IMREAD_COLOR)
 
-    if result.answers:
-        if sheet_class == "Box answer sheet":
-            # ── Answer cards (text only, no crop images) ───────────────────
-            st.markdown("####  Extracted Answers")
+        if image is None:
+            st.error("Could not decode image")
+            st.stop()
 
-            answers_list = list(result.answers.items())
-            num_cols     = min(len(answers_list), 6)
-            rows         = [answers_list[i:i+num_cols]
-                            for i in range(0, len(answers_list), num_cols)]
+        with st.expander("⚙️ Processing Configuration"):
+            auto_align = st.checkbox("Auto alignment", value=True, key="omr_auto_align_single")
+            show_raw_response = st.checkbox(
+                "Show raw response details",
+                value=False,
+                key="omr_raw_response_single",
+            )
 
-            for row in rows:
-                cols = st.columns(len(row))
-                for col, (qid, adict) in zip(cols, row):
-                    answer    = adict.get("answer") or "—"
-                    conf      = adict.get("confidence", 0.0)
-                    box_label = qid.replace("_", " ")   # "Box_0" → "Box 0"
-                    badge     = "" if conf > 0.7 else "" if conf > 0.3 else ""
-                    with col:
-                        st.markdown(
-                            f"""
-                            <div style="
-                                border:2px solid #5a5a8a;
-                                border-radius:10px;
-                                padding:14px 6px 10px;
-                                text-align:center;
-                                background:linear-gradient(135deg,#1e1e2e,#2a2a40);
-                                margin-bottom:8px;
-                            ">
-                                <div style="font-size:11px;color:#888;margin-bottom:4px;">{box_label}</div>
-                                <div style="font-size:32px;font-weight:bold;color:#c8c8ff;
-                                            letter-spacing:3px;line-height:1.1;">{answer}</div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
+        if st.button("🔍 Process Image", type="primary", key="omr_process_single"):
+            with st.spinner("Processing OMR sheet..."):
+                config = build_omrchecker_config(auto_align=auto_align)
+                result = process_omr_image(image, template, config=config)
+
+            if result["success"]:
+                st.success("Processing complete!")
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.image(image, caption="Original Image", width="stretch")
+                with col2:
+                    if result["processed_image"] is not None:
+                        processed_image = result["processed_image"]
+                        if processed_image.ndim == 2 or processed_image.shape[-1] == 1:
+                            processed_rgb = processed_image
+                        else:
+                            processed_rgb = cv2.cvtColor(processed_image, cv2.COLOR_BGR2RGB)
+                        st.image(
+                            processed_rgb,
+                            caption="Processed Image",
+                            width="stretch",
                         )
 
-            # ── Summary line ───────────────────────────────────────────────
-            st.markdown("---")
-            all_answers = [(adict.get("answer") or "—") for _, adict in result.answers.items()]
-            st.markdown("**All answers (left → right):**")
-            st.code("  |  ".join(all_answers), language=None)
-            st.success(
-                f" Extracted **{len(result.answers)}** boxes | "
-                f"Non-empty: **{result.debug_info.get('questions_found', 0)}**"
+                st.subheader("📊 Extracted Answers")
+                if result["response"] and isinstance(result["response"], dict) and len(result["response"]) > 0:
+                    answers = result["response"]
+                    results_df = pd.DataFrame(list(answers.items()), columns=["Question", "Answer"])
+                    st.dataframe(results_df, width="stretch")
+
+                    csv_buffer = StringIO()
+                    results_df.to_csv(csv_buffer, index=False)
+
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.download_button(
+                            label="📥 Download CSV",
+                            data=csv_buffer.getvalue(),
+                            file_name="omr_result.csv",
+                            mime="text/csv",
+                            key="omr_download_csv_single",
+                        )
+                    with col2:
+                        json_str = json.dumps(answers, indent=2)
+                        st.download_button(
+                            label="📥 Download JSON",
+                            data=json_str,
+                            file_name="omr_result.json",
+                            mime="application/json",
+                            key="omr_download_json_single",
+                        )
+
+                    if show_raw_response:
+                        st.json(result.get("raw_response"))
+                else:
+                    st.warning("No answers extracted from the sheet")
+
+                if result.get("multi_mark_count") is not None:
+                    st.caption(f"Multi-mark count: {result['multi_mark_count']}")
+                if result.get("is_invalid") is not None:
+                    st.caption(f"Invalid result: {result['is_invalid']}")
+            else:
+                st.error(f"Processing failed: {result['error']}")
+
+
+def render_template_batch_page():
+    st.markdown("### Batch process multiple OMRChecker sheets")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("#### Template & Images")
+        template_source = st.radio(
+            "Template source",
+            ["Use Sample", "Upload Custom"],
+            label_visibility="collapsed",
+            key="omr_template_source_batch",
+        )
+
+        template_path = None
+        if template_source == "Use Sample":
+            templates = get_sample_templates()
+            if templates:
+                template_name = st.selectbox(
+                    "Select template",
+                    list(templates.keys()),
+                    label_visibility="collapsed",
+                    key="omr_template_select_batch",
+                )
+                template_path = templates[template_name]
+            else:
+                st.warning("No sample templates found")
+                st.stop()
+        else:
+            template_file = st.file_uploader(
+                "Upload template JSON",
+                type="json",
+                label_visibility="collapsed",
+                key="omr_template_upload_batch",
+            )
+            if template_file:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=".json") as tmp:
+                    tmp.write(template_file.getbuffer())
+                    template_path = tmp.name
+            else:
+                st.warning("Please upload a template")
+                st.stop()
+
+    with col2:
+        uploaded_images = st.file_uploader(
+            "Upload multiple images",
+            type=["jpg", "jpeg", "png"],
+            accept_multiple_files=True,
+            label_visibility="collapsed",
+            key="omr_batch_images",
+        )
+
+    if uploaded_images and template_path:
+        with st.expander("⚙️ Batch Configuration"):
+            auto_align = st.checkbox("Auto alignment", value=True, key="omr_auto_align_batch")
+
+        if st.button("🔄 Process All Images", type="primary", key="omr_process_batch"):
+            results_list = []
+
+            template = load_template(template_path)
+            if not template:
+                st.stop()
+
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            config = build_omrchecker_config(auto_align=auto_align)
+
+            for idx, uploaded_img in enumerate(uploaded_images):
+                status_text.text(f"Processing {idx + 1}/{len(uploaded_images)}...")
+
+                img_data = np.frombuffer(uploaded_img.read(), dtype=np.uint8)
+                image = cv2.imdecode(img_data, cv2.IMREAD_COLOR)
+
+                if image is not None:
+                    result = process_omr_image(image, template, config=config)
+                    results_list.append(
+                        {
+                            "filename": uploaded_img.name,
+                            "success": result["success"],
+                            "response": result.get("response"),
+                            "error": result.get("error"),
+                        }
+                    )
+                else:
+                    results_list.append(
+                        {
+                            "filename": uploaded_img.name,
+                            "success": False,
+                            "response": None,
+                            "error": "Could not decode image",
+                        }
+                    )
+
+                progress_bar.progress((idx + 1) / len(uploaded_images))
+
+            st.success(f"✅ Processed {len(results_list)} images")
+
+            st.subheader("Batch Results")
+            results_df = pd.DataFrame(
+                [
+                    {
+                        "File": r["filename"],
+                        "Status": "✅ Success" if r["success"] else "❌ Failed",
+                        "Details": json.dumps(r["response"]) if r["success"] and r["response"] is not None else r["error"],
+                    }
+                    for r in results_list
+                ]
+            )
+
+            st.dataframe(results_df, width="stretch")
+
+            csv_buffer = StringIO()
+            results_df.to_csv(csv_buffer, index=False)
+            st.download_button(
+                label="📥 Download Results CSV",
+                data=csv_buffer.getvalue(),
+                file_name="omr_batch_results.csv",
+                mime="text/csv",
+                key="omr_download_batch_csv",
             )
 
 
+def render_bubble_detector_page():
+    st.markdown("### Bubble Detector")
+    st.markdown("Use Gemini to detect marked bubbles, then compare the result with the bubble reference already saved in the app.")
+
+    reference_answers = load_reference("bubble")
+    if not reference_answers:
+        st.warning("No bubble reference found. Create and save the bubble reference first in the Teacher tab.")
+
+    api_key = os.environ.get("GOOGLE_API_KEY")
+    model_name = "gemini-2.5-flash"
+
+    uploaded_img = st.file_uploader(
+        "Upload answer sheet image",
+        type=["jpg", "jpeg", "png"],
+        key="bubble_detector_upload",
+    )
+
+    if st.button("Detect Bubbles", type="primary", key="bubble_detector_run"):
+        if not api_key:
+            st.error("Set GOOGLE_API_KEY in the environment before running Bubble Detector.")
+        elif not uploaded_img:
+            st.warning("Upload an answer sheet image first.")
+        elif not reference_answers:
+            st.warning("Save the teacher reference first before running bubble detection.")
         else:
-            # Circle fill sheet display (unchanged)
-            st.success(f"Extracted {len(result.answers)} answers")
-            for qid, answer_dict in result.answers.items():
-                answer   = answer_dict.get("answer", "?")
-                conf     = answer_dict.get("confidence", 0.0)
-                status   = "" if conf > 0.7 else "" if conf > 0.4 else ""
-            st.markdown("#### Extracted Answers")
-            answers_list = list(result.answers.items())
-            num_cols     = min(len(answers_list), 6)
-            rows         = [answers_list[i:i+num_cols]
-                            for i in range(0, len(answers_list), num_cols)]
-            for row in rows:
-                cols = st.columns(len(row))
-                for col, (qid, adict) in zip(cols, row):
-                    answer = adict.get("answer") or "—"
-                    with col:
-                        st.markdown(
-                            f"""
-                            <div style="
-                                border:2px solid #5a8a5a;
-                                border-radius:10px;
-                                padding:14px 6px 10px;
-                                text-align:center;
-                                background:linear-gradient(135deg,#1e2e1e,#2a402a);
-                                margin-bottom:8px;
-                            ">
-                                <div style="font-size:11px;color:#888;margin-bottom:4px;">{qid}</div>
-                                <div style="font-size:32px;font-weight:bold;color:#c8ffc8;
-                                            letter-spacing:3px;line-height:1.1;">{answer}</div>
-                                <div style="font-size:10px;color:#666;margin-top:4px;">{badge} {conf:.0%}</div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
+            temp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=Path(uploaded_img.name).suffix or ".png") as tmp:
+                    tmp.write(uploaded_img.getbuffer())
+                    temp_path = Path(tmp.name)
 
-            st.markdown("---")
-            all_answers = [(adict.get("answer") or "—") for _, adict in result.answers.items()]
-            st.markdown("**All answers (left → right):**")
-            st.code("  |  ".join(all_answers), language=None)
-            found = sum(1 for _, a in result.answers.items() if a.get("answer"))
-            st.success(f" Extracted **{len(result.answers)}** questions | Non-empty: **{found}**")
+                checker = GeminiOMRChecker(api_key=api_key, model_name=model_name)
+                result = checker.extract_from_image(str(temp_path))
+
+                grading = compare_answers(result.answers, reference_answers)
+
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.image(uploaded_img, caption="Uploaded Sheet", width="stretch")
+                with col2:
+                    st.metric("Gemini confidence", f"{result.confidence:.2f}")
+                    st.metric("Questions found", str(result.questions_found))
+                    st.metric("Needs review", "Yes" if result.needs_review else "No")
+
+                st.subheader("Detected Answers")
+                detected_df = pd.DataFrame(
+                    [(question, answer) for question, answer in sorted(result.answers.items(), key=lambda item: item[0])],
+                    columns=["Question", "Answer"],
+                )
+                st.dataframe(detected_df, width="stretch", hide_index=True)
+
+                st.markdown("---")
+                st.subheader("Grading Against Teacher Reference")
+                st.markdown(f"**Score:** {grading['score']:.1f}%  |  **Correct:** {grading['correct']}  |  **Incorrect:** {grading['incorrect']}")
+
+                comparison_df = pd.DataFrame(
+                    [
+                        {
+                            "Question": item["question"],
+                            "Reference": item["reference"],
+                            "Detected": item["student"],
+                            "Status": "✅ Correct" if item["correct"] else "❌ Wrong",
+                        }
+                        for item in grading["details"]
+                    ]
+                )
+                st.dataframe(comparison_df, width="stretch", hide_index=True)
+
+                if result.needs_review:
+                    st.info("Gemini confidence is below the review threshold.")
+
+                with st.expander("Raw Gemini response"):
+                    st.code(result.raw_response or "No raw response captured.")
+            except Exception as exc:
+                st.error(f"Bubble detection failed: {exc}")
+            finally:
+                if temp_path is not None and temp_path.exists():
+                    temp_path.unlink(missing_ok=True)
 
 
-    else:
-        st.warning(" No answers extracted — check image quality and YOLO detection")
+def main():
+    st.set_page_config(**PAGE_CONFIG)
+    st.title("AI-Enhanced Multi-Format OMR")
+    st.caption("Pipeline: YOLO detection → Gemini Vision API text extraction | Teacher reference builder | Template-based OMRChecker")
 
-    st.write(f"Valid result: {result.is_valid}")
-    if result.errors:
-        st.error(f"Errors: {'; '.join(result.errors)}")
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "👨‍🏫 Teacher - Create Reference",
+        "👨‍🎓 Table Structure Detector",
+        "⭕ Circle Completion",
+        "📋 Template OMRChecker",
+        "🫧 Bubble Detector",
+    ])
 
-    with st.expander(" Debug Info"):
-        st.json(result.debug_info)
+    # ==================== TEACHER MODE ====================
+    with tab1:
+        render_teacher_page()
+
+    # ==================== STUDENT MODE ====================
+    with tab2:
+        render_student_page()
+
+    # ==================== CIRCLE COMPLETION MODE ====================
+    with tab3:
+        render_circle_completion_page()
+
+    # ==================== TEMPLATE-BASED OMR MODE ====================
+    with tab4:
+        if not OMRCHECKER_ROOT.exists():
+            st.warning("OMRChecker folder was not found in this workspace.")
+            st.stop()
+
+        subtab1, subtab2 = st.tabs(["Single Image", "Batch Process"])
+        with subtab1:
+            render_template_single_page()
+        with subtab2:
+            render_template_batch_page()
+
+    # ==================== BUBBLE DETECTOR ====================
+    with tab5:
+        render_bubble_detector_page()
+
+
+if __name__ == "__main__":
+    main()
 

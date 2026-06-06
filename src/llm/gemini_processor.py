@@ -1,18 +1,21 @@
-"""Gemini API integration for text processing and image understanding."""
-
 from __future__ import annotations
 
 import logging
 import base64
 from typing import Optional
 from pathlib import Path
+import os
 
 import google.genai as genai
 import numpy as np
+import cv2
 from PIL import Image
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 logger = logging.getLogger(__name__)
-
 
 class GeminiProcessor:
     
@@ -23,13 +26,11 @@ class GeminiProcessor:
         debug: bool = False,
     ):
         
-        import os
-        
         self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
         if not self.api_key:
             raise ValueError(
-                "GOOGLE_API_KEY not set. Set environment variable: "
-                "$env:GOOGLE_API_KEY = 'your-api-key'"
+                "GOOGLE_API_KEY not set. Please create a .env file in the project root with: "
+                "GOOGLE_API_KEY=your-api-key-here"
             )
         
         self.model_name = model_name
@@ -48,20 +49,31 @@ class GeminiProcessor:
         max_retries = retries if retries is not None else self._max_retries
         for attempt in range(max_retries + 1):
             try:
+                if self.debug and attempt == 0:
+                    logger.info(f"Calling Gemini API (max retries: {max_retries})...")
+                
                 response = self.client.models.generate_content(
                     model=self.model_name,
                     contents=contents,
                 )
-                return response.text.strip()
+                result = response.text.strip()
+                
+                if self.debug:
+                    logger.info(f"Gemini call successful, got {len(result)} chars")
+                
+                return result
             except Exception as e:
                 err_str = str(e)
-                if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str:
+                is_rate_limit = "429" in err_str or "RESOURCE_EXHAUSTED" in err_str
+                
+                if is_rate_limit:
                     # Try to extract retry-after seconds from error message
                     wait = 20 * (attempt + 1)  # default: 20s, 40s, 60s
                     import re
                     m = re.search(r"retry in ([\d.]+)s", err_str, re.IGNORECASE)
                     if m:
                         wait = int(float(m.group(1))) + 2
+                    
                     if attempt < max_retries:
                         logger.warning(
                             f"Gemini rate limit hit (attempt {attempt+1}/{max_retries+1}). "
@@ -69,8 +81,10 @@ class GeminiProcessor:
                         )
                         time.sleep(wait)
                     else:
+                        logger.error(f"Gemini rate limit exceeded after {max_retries} retries")
                         raise
                 else:
+                    logger.error(f"Gemini API error: {e}", exc_info=True)
                     raise
     
     def normalize_text(
@@ -96,7 +110,7 @@ Text: "{raw_text}"
         
         prompt += """
 Rules:
-1. Correct obvious OCR errors (O→0, I→1 where appropriate)
+1. Correct obvious OCR errors 
 2. Remove extra spaces
 3. Convert to uppercase for answers
 4. Keep only essential characters
@@ -222,16 +236,20 @@ Return ONLY the matching option letter, nothing else."""
                 prompt = prompt_override
             else:
                 prompt = (
-                    "This is a single answer box from a handwritten exam sheet. "
-                    "Look carefully and extract the single letter or number written inside. "
-                    "The writing may be handwritten and slightly messy. "
-                    "Return ONLY that one character (e.g. A, B, C, D, or a digit), nothing else."
+                    "This is an answer row from a handwritten exam sheet with multiple answer boxes. "
+                    "Extract ALL the letters/numbers written in each box, reading left to right. "
+                    "The answers may be handwritten and slightly messy. "
+                    "Return ONLY the letters/numbers separated by spaces (e.g. 'A B D C' or 'ABDC'), nothing else."
                 )
 
             if context:
                 prompt = f"{context}\n{prompt}"
             
-            text = self._call_gemini([prompt, image])
+            if self.debug:
+                logger.info(f"Calling Gemini for {context}...")
+            
+            # Use increased retries for image extraction (more prone to rate limiting)
+            text = self._call_gemini([prompt, image], retries=5)
             
             if self.debug:
                 logger.info(f"Gemini extracted from image: '{text}'")
@@ -243,9 +261,74 @@ Return ONLY the matching option letter, nothing else."""
             }
             
         except Exception as e:
-            logger.error(f"Image extraction failed: {e}")
+            logger.error(f"Image extraction failed: {e}", exc_info=True)
             return {
                 "text": "",
+                "confidence": 0.0,
+                "method": "error",
+                "error": str(e),
+            }
+    
+    def extract_answers_from_row(
+        self,
+        image: np.ndarray | str | Image.Image,
+        num_columns: Optional[int] = None,
+    ) -> dict:
+       
+        try:
+            # Convert to PIL Image
+            if isinstance(image, str):
+                image = Image.open(image)
+            elif isinstance(image, np.ndarray):
+                if image.dtype != np.uint8:
+                    image = (image * 255).astype(np.uint8)
+                if len(image.shape) == 3 and image.shape[2] == 3:
+                    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) if isinstance(image, np.ndarray) else image
+                    image = Image.fromarray(image) if isinstance(image, np.ndarray) else image
+            
+            hint = f" You should extract {num_columns} answers." if num_columns else ""
+            prompt = (
+                "This is an answer row with multiple columns, each containing a letter or number.{hint} "
+                "Extract ALL the letters/numbers from left to right. "
+                "Return ONLY the characters separated by spaces (e.g. 'A B D C'), nothing else."
+            ).format(hint=hint)
+            
+            if self.debug:
+                logger.info(f"Extracting {num_columns or 'multiple'} answers from row image...")
+            
+            raw_text = self._call_gemini([prompt, image], retries=5)
+            
+            # Parse the response into individual answers
+            # Handle both space-separated and concatenated formats
+            answers = []
+            if raw_text:
+                # Try space-separated first
+                if ' ' in raw_text:
+                    answers = raw_text.split()
+                else:
+                    # If no spaces, treat each character as an answer
+                    answers = list(raw_text.strip())
+                
+                # Clean up - keep only alphanumeric
+                answers = [a.upper().strip() for a in answers if a.strip().isalnum()]
+            
+            if self.debug:
+                logger.info(f"Parsed {len(answers)} answers: {answers}")
+            
+            return {
+                "answers": answers,
+                "raw_text": raw_text,
+                "count": len(answers),
+                "confidence": 0.85,
+                "method": "gemini_row",
+            }
+            
+        except Exception as e:
+            logger.error(f"Row extraction failed: {e}", exc_info=True)
+            return {
+                "answers": [],
+                "raw_text": "",
+                "count": 0,
                 "confidence": 0.0,
                 "method": "error",
                 "error": str(e),
